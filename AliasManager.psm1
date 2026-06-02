@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     Programmatic App Execution Alias generator.
@@ -7,8 +7,8 @@
     Reworked from winget-cli PortableInstaller.cpp + PortableFlow.cpp (commit c8fe1ea0).
     Replicates the full portable install pipeline without requiring MSIX or winget:
 
-      PortableFlow.cpp  → ResolveAliasName(), New-AppAlias entry-point
-      PortableInstaller → Install-File, Add-ToPathVariable, Register-ARPEntry,
+      PortableFlow.cpp  -> ResolveAliasName(), New-AppAlias entry-point
+      PortableInstaller -> Install-File, Add-ToPathVariable, Register-ARPEntry,
                           Create-TargetDirectory, CreateSymlink w/ PATH fallback
 
     Source:
@@ -105,7 +105,7 @@ public static extern IntPtr SendMessageTimeout(
             [IntPtr]0xFFFF, 0x001A, [UIntPtr]::Zero, 'Environment',
             0x0002, 5000, [ref]$result) | Out-Null
 
-        Write-Verbose "Appended '$Directory' to $Scope PATH — shell restart may be required."
+        Write-Verbose "Appended '$Directory' to $Scope PATH - shell restart may be required."
         return $true
     }
     Write-Verbose "'$Directory' already in $Scope PATH."
@@ -135,7 +135,7 @@ function New-Symlink {
     .DESCRIPTION
         Attempts to create a filesystem symlink (requires SeCreateSymbolicLinkPrivilege
         or Developer Mode on Win10+).  Returns $true on success, $false on failure
-        so the caller can fall back to adding the install dir to PATH instead —
+        so the caller can fall back to adding the install dir to PATH instead -
         exactly as PortableInstaller::InstallFile() does.
     #>
     param(
@@ -153,7 +153,7 @@ function New-Symlink {
         # Use cmd mklink so we don't depend on PowerShell version for symlink support
         $null = & cmd /c mklink "$LinkPath" "$TargetPath" 2>&1
         if ($LASTEXITCODE -eq 0 -and (Test-Path $LinkPath)) {
-            Write-Verbose "Symlink created: '$LinkPath' → '$TargetPath'"
+            Write-Verbose "Symlink created: '$LinkPath' -> '$TargetPath'"
             return $true
         }
         return $false
@@ -170,7 +170,7 @@ function Register-ARPEntry {
     <#
     .DESCRIPTION
         Writes the Uninstall registry key that makes the alias appear in
-        Settings → Apps and in the ARP list.
+        Settings -> Apps and in the ARP list.
         Mirrors PortableInstaller::RegisterARPEntry() + CommitToARPEntry().
 
         Key path:
@@ -247,7 +247,7 @@ function Register-AppPaths {
     if (-not (Test-Path $keyPath)) { New-Item -Path $keyPath -Force | Out-Null }
     Set-ItemProperty -Path $keyPath -Name '(Default)' -Value $TargetPath
     Set-ItemProperty -Path $keyPath -Name 'Path'      -Value ([System.IO.Path]::GetDirectoryName($TargetPath))
-    Write-Verbose "App Paths registered: $keyPath → $TargetPath"
+    Write-Verbose "App Paths registered: $keyPath -> $TargetPath"
 }
 
 function Remove-AppPaths {
@@ -264,7 +264,7 @@ function Remove-AppPaths {
 }
 
 # ---------------------------------------------------------------------------
-# Region: Public API — New-AppAlias (Install)
+# Region: Public API - New-AppAlias (Install)
 # ---------------------------------------------------------------------------
 
 function New-AppAlias {
@@ -278,7 +278,7 @@ function New-AppAlias {
           2. Register ARP entry (before file ops, so failure is recoverable)
           3. Create target install directory
           4. Copy exe to install root
-          5. Create symlink in links directory  → fallback to PATH if symlink fails
+          5. Create symlink in links directory  -> fallback to PATH if symlink fails
           6. Ensure links directory is on PATH
           7. Register App Paths (Win+R / ShellExecute support)
 
@@ -398,7 +398,7 @@ function New-AppAlias {
     # --- Step 7: App Paths (Win+R / ShellExecute)
     Register-AppPaths -AliasName $aliasName -TargetPath $targetExe -Scope $Scope
 
-    Write-Host "✓ Alias '$($aliasName -replace '\.exe$')' created → $targetExe" -ForegroundColor Green
+    Write-Host "✓ Alias '$($aliasName -replace '\.exe$')' created -> $targetExe" -ForegroundColor Green
     if ($symlinkCreated) {
         Write-Host "  Symlink : $symlinkPath" -ForegroundColor DarkGray
     }
@@ -408,7 +408,7 @@ function New-AppAlias {
 }
 
 # ---------------------------------------------------------------------------
-# Region: Public API — Remove-AppAlias (Uninstall)
+# Region: Public API - Remove-AppAlias (Uninstall)
 # ---------------------------------------------------------------------------
 
 function Remove-AppAlias {
@@ -498,7 +498,7 @@ function Remove-AppAlias {
 }
 
 # ---------------------------------------------------------------------------
-# Region: Public API — Get-AppAlias (List)
+# Region: Public API - Get-AppAlias (List)
 # ---------------------------------------------------------------------------
 
 function Get-AppAlias {
@@ -525,7 +525,7 @@ function Get-AppAlias {
                     Alias          = [System.IO.Path]::GetFileName($props.PortableSymlinkFullPath)
                     Target         = $props.PortableTargetFullPath
                     InstallLocation= $props.InstallLocation
-                    Scope          = if ($hive -eq 'HKCU') { 'User' } else { 'Machine' }
+                    Scope          = $(if ($hive -eq 'HKCU') { 'User' } else { 'Machine' })
                 }
             }
     }
