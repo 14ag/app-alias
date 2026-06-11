@@ -1,9 +1,11 @@
+#include "AppAliasCore.h"
+
 #include <Windows.h>
 #include <shellapi.h>
 
+#include <exception>
 #include <filesystem>
 #include <fstream>
-#include <regex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -12,34 +14,18 @@ namespace fs = std::filesystem;
 
 namespace
 {
-    std::wstring Utf8ToWide(const std::string& value)
+    wchar_t AsciiLower(wchar_t ch)
     {
-        if (value.empty())
+        if (ch >= L'A' && ch <= L'Z')
         {
-            return {};
+            return static_cast<wchar_t>(ch - L'A' + L'a');
         }
-
-        const int size = MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0);
-        std::wstring result(static_cast<size_t>(size), L'\0');
-        MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), size);
-        return result;
-    }
-
-    fs::path ModulePath()
-    {
-        std::wstring buffer(MAX_PATH, L'\0');
-        DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
-        if (length == 0)
-        {
-            return {};
-        }
-        buffer.resize(length);
-        return fs::path(buffer);
+        return ch;
     }
 
     std::wstring ReadTarget()
     {
-        std::ifstream file(ModulePath().parent_path() / L"alias.json", std::ios::binary);
+        std::ifstream file(appalias::GetModulePath().parent_path() / L"alias.json", std::ios::binary);
         if (!file)
         {
             return {};
@@ -47,41 +33,7 @@ namespace
 
         std::stringstream buffer;
         buffer << file.rdbuf();
-        const std::wstring json = Utf8ToWide(buffer.str());
-        std::wregex pattern(LR"json("target"\s*:\s*"([^"]+)")json");
-        std::wsmatch match;
-        if (!std::regex_search(json, match, pattern))
-        {
-            return {};
-        }
-
-        std::wstring target = match[1].str();
-        for (size_t index = 0; index + 1 < target.size(); ++index)
-        {
-            if (target[index] == L'\\' && target[index + 1] == L'\\')
-            {
-                target.erase(index, 1);
-            }
-        }
-        return target;
-    }
-
-    std::wstring Quote(const std::wstring& value)
-    {
-        std::wstring result = L"\"";
-        for (const wchar_t ch : value)
-        {
-            if (ch == L'"')
-            {
-                result += L"\\\"";
-            }
-            else
-            {
-                result.push_back(ch);
-            }
-        }
-        result.push_back(L'"');
-        return result;
+        return appalias::JsonStringValue(appalias::Utf8ToWide(buffer.str()), L"target");
     }
 
     std::wstring BuildForwardedArgs()
@@ -100,7 +52,7 @@ namespace
             {
                 args.push_back(L' ');
             }
-            args += Quote(argv[index]);
+            args += appalias::QuoteCommandArgument(argv[index]);
         }
 
         LocalFree(argv);
@@ -116,7 +68,7 @@ namespace
 
         for (size_t index = 0; index < suffix.size(); ++index)
         {
-            if (towlower(value[value.size() - suffix.size() + index]) != towlower(suffix[index]))
+            if (AsciiLower(value[value.size() - suffix.size() + index]) != AsciiLower(suffix[index]))
             {
                 return false;
             }
@@ -127,63 +79,70 @@ namespace
 
 int wmain()
 {
-    const std::wstring target = ReadTarget();
-    if (target.empty())
+    try
     {
-        fwprintf(stderr, L"alias target not configured\n");
-        return 2;
-    }
-
-    const std::wstring args = BuildForwardedArgs();
-    std::wstring application;
-    std::wstring command;
-
-    if (EndsWithInsensitive(target, L".cmd") || EndsWithInsensitive(target, L".bat"))
-    {
-        wchar_t systemDirectory[MAX_PATH]{};
-        if (GetSystemDirectoryW(systemDirectory, MAX_PATH) == 0)
+        const std::wstring target = ReadTarget();
+        if (target.empty())
         {
-            application = L"cmd.exe";
+            fwprintf(stderr, L"alias target not configured\n");
+            return 2;
+        }
+
+        const std::wstring args = BuildForwardedArgs();
+        std::wstring application;
+        std::wstring command;
+
+        if (EndsWithInsensitive(target, L".cmd") || EndsWithInsensitive(target, L".bat"))
+        {
+            wchar_t systemDirectory[MAX_PATH]{};
+            if (GetSystemDirectoryW(systemDirectory, MAX_PATH) == 0)
+            {
+                fwprintf(stderr, L"failed to locate system directory: %lu\n", GetLastError());
+                return 3;
+            }
+
+            application = (fs::path(systemDirectory) / L"cmd.exe").wstring();
+            command = appalias::QuoteCommandArgument(application) + L" /d /c \"\"" + target + L"\"";
+            if (!args.empty())
+            {
+                command.push_back(L' ');
+                command += args;
+            }
+            command += L"\"";
         }
         else
         {
-            application = (fs::path(systemDirectory) / L"cmd.exe").wstring();
+            application = target;
+            command = appalias::QuoteCommandArgument(target);
+            if (!args.empty())
+            {
+                command.push_back(L' ');
+                command += args;
+            }
         }
-        command = L"cmd.exe /d /c \"\"" + target + L"\"";
-        if (!args.empty())
-        {
-            command.push_back(L' ');
-            command += args;
-        }
-        command += L"\"";
-    }
-    else
-    {
-        application = target;
-        command = Quote(target);
-        if (!args.empty())
-        {
-            command.push_back(L' ');
-            command += args;
-        }
-    }
 
-    STARTUPINFOW startup{};
-    startup.cb = sizeof(startup);
-    PROCESS_INFORMATION process{};
-    std::vector<wchar_t> mutableCommand(command.begin(), command.end());
-    mutableCommand.push_back(L'\0');
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        PROCESS_INFORMATION process{};
+        std::vector<wchar_t> mutableCommand(command.begin(), command.end());
+        mutableCommand.push_back(L'\0');
 
-    if (!CreateProcessW(application.c_str(), mutableCommand.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &startup, &process))
+        if (!CreateProcessW(application.c_str(), mutableCommand.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &startup, &process))
+        {
+            fwprintf(stderr, L"failed to launch alias target: %lu\n", GetLastError());
+            return 3;
+        }
+
+        WaitForSingleObject(process.hProcess, INFINITE);
+        DWORD exitCode = 1;
+        GetExitCodeProcess(process.hProcess, &exitCode);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        return static_cast<int>(exitCode);
+    }
+    catch (const std::exception& error)
     {
-        fwprintf(stderr, L"failed to launch alias target: %lu\n", GetLastError());
+        fwprintf(stderr, L"alias proxy error: %s\n", appalias::Utf8ToWide(error.what()).c_str());
         return 3;
     }
-
-    WaitForSingleObject(process.hProcess, INFINITE);
-    DWORD exitCode = 1;
-    GetExitCodeProcess(process.hProcess, &exitCode);
-    CloseHandle(process.hThread);
-    CloseHandle(process.hProcess);
-    return static_cast<int>(exitCode);
 }

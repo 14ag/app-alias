@@ -1,5 +1,8 @@
 #include "AppAliasCore.h"
 
+#include <Windows.h>
+
+#include <algorithm>
 #include <iostream>
 #include <array>
 #include <filesystem>
@@ -38,7 +41,7 @@ namespace
             std::wcerr << L"[FAIL] " << message << L"\n";
             ++failures;
         }
-        catch (const std::exception&)
+        catch (...)
         {
         }
     }
@@ -49,6 +52,7 @@ namespace
         AssertThrows([] { appalias::NormalizeAlias(L"code-insiders"); }, L"alias without .exe should be rejected");
         AssertThrows([] { appalias::NormalizeAlias(L"..\\code.exe"); }, L"path separators should be rejected");
         AssertThrows([] { appalias::NormalizeAlias(L"bad name.exe"); }, L"spaces should be rejected");
+        AssertThrows([] { appalias::NormalizeAlias(L"bad\u2603.exe"); }, L"unicode alias characters should be rejected");
     }
 
     void TestIdentity()
@@ -60,6 +64,9 @@ namespace
         AssertTrue(first.packageName.rfind(L"AppAliasGenerator.codeinsiders.", 0) == 0, L"package identity should include sanitized alias");
         AssertEqual(L"AliasApp", first.applicationId, L"application id should match manifest app id");
         AssertEqual(L"CN=AppAliasGenerator", first.publisher, L"default publisher subject should be fixed");
+        AssertEqual(L"2.3.4.5", appalias::BuildIdentity(L"code-insiders.exe", L"", L"", L"2.3.4.5").version, L"explicit package version should be used");
+        AssertThrows([] { appalias::BuildIdentity(L"code-insiders.exe", L"", L"", L"1.2.3"); }, L"three-part package version should be rejected");
+        AssertThrows([] { appalias::BuildIdentity(L"code-insiders.exe", L"", L"", L"1.2.3.70000"); }, L"out-of-range package version should be rejected");
     }
 
     void TestManifest()
@@ -77,11 +84,22 @@ namespace
         AssertTrue(manifest.find(L"uap10:AllowExternalContent") == std::wstring::npos, L"full package manifest should not allow external content");
     }
 
+    bool ExistsByAttributes(const std::filesystem::path& path)
+    {
+        return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+    }
+
     void TestListAliasesHandlesWindowsAppsStubs()
     {
         try
         {
             const auto records = appalias::ListAliases();
+            if (!ExistsByAttributes(appalias::GetWindowsAppsAliasPath(L"winget.exe")))
+            {
+                std::wcout << L"[SKIP] winget.exe alias not installed\n";
+                return;
+            }
+
             const auto found = std::find_if(records.begin(), records.end(), [](const appalias::AliasRecord& record) {
                 return record.alias == L"winget.exe";
             });
@@ -113,13 +131,42 @@ namespace
         std::error_code ec;
         std::filesystem::remove_all(packageRoot, ec);
 
-        appalias::StageVisualAssets(packageRoot, L"C:\\Windows\\System32\\notepad.exe");
+        wchar_t systemDirectory[MAX_PATH]{};
+        if (GetSystemDirectoryW(systemDirectory, MAX_PATH) == 0)
+        {
+            std::wcout << L"[SKIP] system directory not found\n";
+            return;
+        }
+
+        const auto notepad = std::filesystem::path(systemDirectory) / L"notepad.exe";
+        if (!std::filesystem::exists(notepad))
+        {
+            std::wcout << L"[SKIP] notepad.exe not installed\n";
+            return;
+        }
+
+        appalias::StageVisualAssets(packageRoot, notepad);
 
         AssertTrue(HasPngSignature(packageRoot / L"Assets" / L"StoreLogo.png"), L"store logo should be target icon png");
         AssertTrue(HasPngSignature(packageRoot / L"Assets" / L"Square44x44Logo.png"), L"square 44 logo should be target icon png");
         AssertTrue(HasPngSignature(packageRoot / L"Assets" / L"Square150x150Logo.png"), L"square 150 logo should be target icon png");
 
         std::filesystem::remove_all(packageRoot, ec);
+    }
+
+    void TestJsonStringParsing()
+    {
+        const std::wstring json = LR"({"target":"C:\\Users\\Name\n\r\t\"tool\"\u0041","other":"value"})";
+        AssertEqual(L"C:\\Users\\Name\n\r\t\"tool\"A", appalias::JsonStringValue(json, L"target"), L"json parser should unescape target");
+
+        const std::wstring roundTrip = L"{\"target\":" + appalias::ToJsonString(L"C:\\Path\\\"quoted\"\n") + L"}";
+        AssertEqual(L"C:\\Path\\\"quoted\"\n", appalias::JsonStringValue(roundTrip, L"target"), L"json parser should read ToJsonString output");
+    }
+
+    void TestPathToFileUriEncoding()
+    {
+        const auto uri = appalias::PathToFileUri(L"C:\\tools\\caf\u00E9 #100%?.msix");
+        AssertEqual(L"file:///C:/tools/caf%C3%A9%20%23100%25%3F.msix", uri, L"file uri should percent-encode special characters");
     }
 }
 
@@ -128,6 +175,8 @@ int wmain()
     TestAliasNormalization();
     TestIdentity();
     TestManifest();
+    TestJsonStringParsing();
+    TestPathToFileUriEncoding();
     TestListAliasesHandlesWindowsAppsStubs();
     TestStageVisualAssetsExtractsTargetIcon();
 

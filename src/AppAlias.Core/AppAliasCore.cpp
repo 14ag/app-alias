@@ -24,9 +24,13 @@ namespace Gdiplus
 #include <winrt/Windows.Storage.h>
 
 #include <array>
+#include <charconv>
+#include <cwctype>
 #include <cstdint>
 #include <fstream>
 #include <iomanip>
+#include <map>
+#include <mutex>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
@@ -42,9 +46,20 @@ namespace
     constexpr wchar_t DefaultVersion[] = L"1.0.0.0";
     constexpr DWORD AppExecLinkTag = 0x8000001B;
 
+    void EnsureWinrtApartment();
+
+    wchar_t AsciiLower(wchar_t ch)
+    {
+        if (ch >= L'A' && ch <= L'Z')
+        {
+            return static_cast<wchar_t>(ch - L'A' + L'a');
+        }
+        return ch;
+    }
+
     std::wstring Lower(std::wstring value)
     {
-        std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch) { return static_cast<wchar_t>(towlower(ch)); });
+        std::transform(value.begin(), value.end(), value.begin(), AsciiLower);
         return value;
     }
 
@@ -53,7 +68,7 @@ namespace
         return value.size() >= prefix.size() && value.substr(0, prefix.size()) == prefix;
     }
 
-    std::string WideToUtf8(std::wstring_view value)
+    std::string WideToUtf8Impl(std::wstring_view value)
     {
         if (value.empty())
         {
@@ -67,25 +82,31 @@ namespace
         }
 
         std::string result(static_cast<size_t>(size), '\0');
-        WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), size, nullptr, nullptr);
+        if (WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), size, nullptr, nullptr) != size)
+        {
+            throw std::runtime_error("WideCharToMultiByte failed");
+        }
         return result;
     }
 
-    std::wstring Utf8ToWide(std::string_view value)
+    std::wstring Utf8ToWideImpl(std::string_view value)
     {
         if (value.empty())
         {
             return {};
         }
 
-        const int size = MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0);
+        const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()), nullptr, 0);
         if (size <= 0)
         {
             throw std::runtime_error("MultiByteToWideChar failed");
         }
 
         std::wstring result(static_cast<size_t>(size), L'\0');
-        MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), size);
+        if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()), result.data(), size) != size)
+        {
+            throw std::runtime_error("MultiByteToWideChar failed");
+        }
         return result;
     }
 
@@ -110,19 +131,22 @@ namespace
     std::wstring StripExe(std::wstring alias)
     {
         constexpr std::wstring_view exe = L".exe";
-        if (alias.size() >= exe.size())
+        if (alias.size() < exe.size() || alias.substr(alias.size() - exe.size()) != exe)
         {
-            alias.resize(alias.size() - exe.size());
+            throw std::invalid_argument("alias must end with .exe");
         }
+
+        alias.resize(alias.size() - exe.size());
         return alias;
     }
 
     uint32_t Fnv1a32(std::wstring_view value)
     {
         uint32_t hash = 2166136261u;
-        for (const wchar_t ch : value)
+        const std::string bytes = WideToUtf8Impl(Lower(std::wstring(value)));
+        for (const unsigned char byte : bytes)
         {
-            hash ^= static_cast<uint16_t>(towlower(ch));
+            hash ^= byte;
             hash *= 16777619u;
         }
         return hash;
@@ -142,7 +166,7 @@ namespace
         {
             if ((ch >= L'a' && ch <= L'z') || (ch >= L'A' && ch <= L'Z') || (ch >= L'0' && ch <= L'9'))
             {
-                result.push_back(static_cast<wchar_t>(towlower(ch)));
+                result.push_back(AsciiLower(ch));
             }
         }
 
@@ -197,7 +221,7 @@ namespace
             throw std::runtime_error("failed to open output file");
         }
 
-        const auto bytes = WideToUtf8(text);
+        const auto bytes = WideToUtf8Impl(text);
         file.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
     }
 
@@ -211,10 +235,10 @@ namespace
 
         std::stringstream buffer;
         buffer << file.rdbuf();
-        return Utf8ToWide(buffer.str());
+        return Utf8ToWideImpl(buffer.str());
     }
 
-    fs::path GetModulePath()
+    fs::path GetModulePathImpl()
     {
         std::wstring buffer(MAX_PATH, L'\0');
         DWORD length = 0;
@@ -236,7 +260,7 @@ namespace
         }
     }
 
-    std::wstring Quote(std::wstring_view value)
+    std::wstring QuoteCommandArgumentImpl(std::wstring_view value)
     {
         std::wstring result = L"\"";
         for (const wchar_t ch : value)
@@ -256,7 +280,7 @@ namespace
 
     int RunProcess(const fs::path& exe, const std::wstring& args)
     {
-        std::wstring command = Quote(exe.wstring());
+        std::wstring command = QuoteCommandArgumentImpl(exe.wstring());
         if (!args.empty())
         {
             command.push_back(L' ');
@@ -295,43 +319,67 @@ namespace
 
     fs::path FindSdkTool(const std::wstring& tool)
     {
+        static std::mutex cacheMutex;
+        static std::map<std::wstring, fs::path> cache;
+
+        const std::wstring cacheKey = Lower(tool);
+        {
+            std::lock_guard<std::mutex> lock(cacheMutex);
+            const auto found = cache.find(cacheKey);
+            if (found != cache.end())
+            {
+                return found->second;
+            }
+        }
+
+        fs::path result;
         const auto fromPath = SearchPathTool(tool);
         if (!fromPath.empty())
         {
-            return fromPath;
+            result = fromPath;
         }
-
-        const std::wstring programFilesX86 = GetEnvPath(L"ProgramFiles(x86)");
-        if (programFilesX86.empty())
+        else
         {
-            return {};
-        }
-
-        const fs::path binRoot = fs::path(programFilesX86) / L"Windows Kits" / L"10" / L"bin";
-        if (!fs::exists(binRoot))
-        {
-            return {};
-        }
-
-        std::vector<fs::path> candidates;
-        for (const auto& entry : fs::recursive_directory_iterator(binRoot))
-        {
-            if (entry.is_regular_file() && Lower(entry.path().filename().wstring()) == Lower(tool))
+            const std::wstring programFilesX86 = GetEnvPath(L"ProgramFiles(x86)");
+            if (!programFilesX86.empty())
             {
-                const auto parent = Lower(entry.path().parent_path().filename().wstring());
-                if (parent == L"x64")
+                const fs::path binRoot = fs::path(programFilesX86) / L"Windows Kits" / L"10" / L"bin";
+                if (ExistsNoThrow(binRoot))
                 {
-                    candidates.push_back(entry.path());
+                    std::vector<fs::path> candidates;
+                    std::error_code ec;
+                    fs::recursive_directory_iterator iterator(binRoot, fs::directory_options::skip_permission_denied, ec);
+                    const fs::recursive_directory_iterator end;
+                    while (!ec && iterator != end)
+                    {
+                        const auto& entry = *iterator;
+                        std::error_code fileEc;
+                        if (entry.is_regular_file(fileEc) && !fileEc && Lower(entry.path().filename().wstring()) == cacheKey)
+                        {
+                            const auto parent = Lower(entry.path().parent_path().filename().wstring());
+                            if (parent == L"x64")
+                            {
+                                candidates.push_back(entry.path());
+                            }
+                        }
+
+                        iterator.increment(ec);
+                    }
+
+                    std::sort(candidates.begin(), candidates.end(), std::greater<fs::path>());
+                    if (!candidates.empty())
+                    {
+                        result = candidates.front();
+                    }
                 }
             }
         }
 
-        std::sort(candidates.begin(), candidates.end(), std::greater<fs::path>());
-        if (!candidates.empty())
         {
-            return candidates.front();
+            std::lock_guard<std::mutex> lock(cacheMutex);
+            cache[cacheKey] = result;
         }
-        return {};
+        return result;
     }
 
     fs::path DefaultPfxPath()
@@ -351,6 +399,64 @@ namespace
         return publisher.empty() ? DefaultPublisher : publisher;
     }
 
+    bool IsValidPackageVersion(std::wstring_view version)
+    {
+        if (version.empty())
+        {
+            return false;
+        }
+
+        size_t start = 0;
+        int parts = 0;
+        while (start <= version.size())
+        {
+            const size_t dot = version.find(L'.', start);
+            const size_t end = dot == std::wstring_view::npos ? version.size() : dot;
+            if (end == start || end - start > 5)
+            {
+                return false;
+            }
+
+            uint32_t value = 0;
+            for (size_t index = start; index < end; ++index)
+            {
+                if (version[index] < L'0' || version[index] > L'9')
+                {
+                    return false;
+                }
+                value = (value * 10) + static_cast<uint32_t>(version[index] - L'0');
+                if (value > 65535)
+                {
+                    return false;
+                }
+            }
+
+            ++parts;
+            if (dot == std::wstring_view::npos)
+            {
+                break;
+            }
+            start = dot + 1;
+        }
+
+        return parts == 4;
+    }
+
+    std::wstring ResolvePackageVersion(std::wstring_view version)
+    {
+        if (version.empty())
+        {
+            return DefaultVersion;
+        }
+
+        if (!IsValidPackageVersion(version))
+        {
+            throw std::invalid_argument("package version must be four dot-separated numbers from 0 to 65535");
+        }
+
+        return std::wstring(version);
+    }
+
     fs::path ConfiguredPfxPath()
     {
         const std::wstring configured = GetEnvPath(L"APPALIAS_PFX");
@@ -361,24 +467,35 @@ namespace
         return DefaultPfxPath();
     }
 
-    std::wstring PathToFileUri(const fs::path& path)
+    std::wstring PathToFileUriImpl(const fs::path& path)
     {
         std::wstring value = fs::absolute(path).wstring();
         std::replace(value.begin(), value.end(), L'\\', L'/');
         std::wstring uri = L"file:///";
-        for (const wchar_t ch : value)
+        const std::string bytes = WideToUtf8Impl(value);
+        constexpr wchar_t hex[] = L"0123456789ABCDEF";
+        for (const unsigned char byte : bytes)
         {
-            if (ch == L' ')
+            const bool unreserved =
+                (byte >= 'A' && byte <= 'Z') ||
+                (byte >= 'a' && byte <= 'z') ||
+                (byte >= '0' && byte <= '9') ||
+                byte == '-' ||
+                byte == '.' ||
+                byte == '_' ||
+                byte == '~' ||
+                byte == '/' ||
+                byte == ':';
+
+            if (unreserved)
             {
-                uri += L"%20";
-            }
-            else if (ch == L'#')
-            {
-                uri += L"%23";
+                uri.push_back(static_cast<wchar_t>(byte));
             }
             else
             {
-                uri.push_back(ch);
+                uri.push_back(L'%');
+                uri.push_back(hex[(byte >> 4) & 0x0F]);
+                uri.push_back(hex[byte & 0x0F]);
             }
         }
         return uri;
@@ -396,9 +513,9 @@ namespace
 
     void CopyProxy(const fs::path& destinationRoot)
     {
-        const fs::path current = GetModulePath();
+        const fs::path current = GetModulePathImpl();
         const fs::path proxySource = current.parent_path() / L"AppAlias.Proxy.exe";
-        if (!fs::exists(proxySource))
+        if (!ExistsNoThrow(proxySource))
         {
             throw std::runtime_error("AppAlias.Proxy.exe not found next to CLI");
         }
@@ -409,29 +526,77 @@ namespace
 
     CLSID GetPngEncoderClsid()
     {
-        UINT count = 0;
-        UINT bytes = 0;
-        if (Gdiplus::GetImageEncodersSize(&count, &bytes) != Gdiplus::Ok || bytes == 0)
-        {
-            throw std::runtime_error("failed to enumerate image encoders");
-        }
+        static std::once_flag once;
+        static CLSID cached{};
+        static std::exception_ptr failure;
 
-        std::vector<unsigned char> buffer(bytes);
-        auto* encoders = reinterpret_cast<Gdiplus::ImageCodecInfo*>(buffer.data());
-        if (Gdiplus::GetImageEncoders(count, bytes, encoders) != Gdiplus::Ok)
-        {
-            throw std::runtime_error("failed to read image encoders");
-        }
-
-        for (UINT index = 0; index < count; ++index)
-        {
-            if (wcscmp(encoders[index].MimeType, L"image/png") == 0)
+        std::call_once(once, [] {
+            try
             {
-                return encoders[index].Clsid;
+                UINT count = 0;
+                UINT bytes = 0;
+                if (Gdiplus::GetImageEncodersSize(&count, &bytes) != Gdiplus::Ok || bytes == 0)
+                {
+                    throw std::runtime_error("failed to enumerate image encoders");
+                }
+
+                std::vector<unsigned char> buffer(bytes);
+                auto* encoders = reinterpret_cast<Gdiplus::ImageCodecInfo*>(buffer.data());
+                if (Gdiplus::GetImageEncoders(count, bytes, encoders) != Gdiplus::Ok)
+                {
+                    throw std::runtime_error("failed to read image encoders");
+                }
+
+                for (UINT index = 0; index < count; ++index)
+                {
+                    if (wcscmp(encoders[index].MimeType, L"image/png") == 0)
+                    {
+                        cached = encoders[index].Clsid;
+                        return;
+                    }
+                }
+
+                throw std::runtime_error("png encoder not found");
             }
+            catch (...)
+            {
+                failure = std::current_exception();
+            }
+        });
+
+        if (failure)
+        {
+            std::rethrow_exception(failure);
         }
 
-        throw std::runtime_error("png encoder not found");
+        return cached;
+    }
+
+    void EnsureGdiplusStarted()
+    {
+        static std::once_flag once;
+        static ULONG_PTR token = 0;
+        static std::exception_ptr failure;
+
+        std::call_once(once, [] {
+            try
+            {
+                Gdiplus::GdiplusStartupInput input{};
+                if (Gdiplus::GdiplusStartup(&token, &input, nullptr) != Gdiplus::Ok)
+                {
+                    throw std::runtime_error("failed to initialize gdiplus");
+                }
+            }
+            catch (...)
+            {
+                failure = std::current_exception();
+            }
+        });
+
+        if (failure)
+        {
+            std::rethrow_exception(failure);
+        }
     }
 
     void SaveIconAsPng(HICON icon, const fs::path& path, int size)
@@ -454,20 +619,25 @@ namespace
 
     HICON GetTargetIcon(const fs::path& target)
     {
-        SHFILEINFOW info{};
-        const DWORD_PTR result = SHGetFileInfoW(
-            target.c_str(),
-            FILE_ATTRIBUTE_NORMAL,
-            &info,
-            sizeof(info),
-            SHGFI_ICON | SHGFI_LARGEICON);
-
-        if (result == 0 || info.hIcon == nullptr)
+        HICON largeIcon = nullptr;
+        HICON smallIcon = nullptr;
+        const UINT count = ExtractIconExW(target.c_str(), 0, &largeIcon, &smallIcon, 1);
+        if (count == 0 || count == static_cast<UINT>(-1))
         {
             throw std::runtime_error("failed to extract target icon");
         }
 
-        return info.hIcon;
+        if (smallIcon)
+        {
+            DestroyIcon(smallIcon);
+        }
+
+        if (!largeIcon)
+        {
+            throw std::runtime_error("failed to extract target icon");
+        }
+
+        return largeIcon;
     }
 
     void PackMsix(const appalias::PackageIdentity& identity)
@@ -483,7 +653,7 @@ namespace
         std::error_code ec;
         fs::remove(packagePath, ec);
 
-        const std::wstring args = L"pack /o /d " + Quote(packageRoot.wstring()) + L" /nv /p " + Quote(packagePath.wstring());
+        const std::wstring args = L"pack /o /d " + QuoteCommandArgumentImpl(packageRoot.wstring()) + L" /p " + QuoteCommandArgumentImpl(packagePath.wstring());
         const int exitCode = RunProcess(makeappx, args);
         if (exitCode != 0)
         {
@@ -504,7 +674,7 @@ namespace
         std::wstring args = L"sign /fd SHA256 ";
         if (!certSha1.empty())
         {
-            args += L"/s My /sha1 " + Quote(certSha1) + L" ";
+            args += L"/s My /sha1 " + QuoteCommandArgumentImpl(certSha1) + L" ";
             if (certStore == L"localmachine" || certStore == L"machine")
             {
                 args += L"/sm ";
@@ -513,14 +683,14 @@ namespace
         else
         {
             const fs::path pfx = ConfiguredPfxPath();
-            if (!fs::exists(pfx))
+            if (!ExistsNoThrow(pfx))
             {
                 throw std::runtime_error("signing certificate not found; run scripts\\New-AppAliasCert.ps1");
             }
-            args += L"/f " + Quote(pfx.wstring()) + L" /p " + Quote(DefaultPfxPassword()) + L" ";
+            args += L"/f " + QuoteCommandArgumentImpl(pfx.wstring()) + L" /p " + QuoteCommandArgumentImpl(DefaultPfxPassword()) + L" ";
         }
 
-        args += Quote(appalias::GetPackageMsixPath(identity).wstring());
+        args += QuoteCommandArgumentImpl(appalias::GetPackageMsixPath(identity).wstring());
         const int exitCode = RunProcess(signtool, args);
         if (exitCode != 0)
         {
@@ -533,13 +703,13 @@ namespace
         appalias::OperationResult result{};
         try
         {
-            winrt::init_apartment();
+            EnsureWinrtApartment();
 
             winrt::Windows::Management::Deployment::PackageManager packageManager;
             winrt::Windows::Management::Deployment::AddPackageOptions options;
 
             const auto deployment = packageManager.AddPackageByUriAsync(
-                winrt::Windows::Foundation::Uri(PathToFileUri(appalias::GetPackageMsixPath(identity))),
+                winrt::Windows::Foundation::Uri(PathToFileUriImpl(appalias::GetPackageMsixPath(identity))),
                 options).get();
 
             const HRESULT hr = deployment.ExtendedErrorCode();
@@ -563,7 +733,7 @@ namespace
         catch (const std::exception& error)
         {
             result.succeeded = false;
-            result.message = Utf8ToWide(error.what());
+            result.message = Utf8ToWideImpl(error.what());
         }
         return result;
     }
@@ -586,28 +756,160 @@ namespace
         return appalias::GetStateRoot() / L"External" / packageName / L"alias.json";
     }
 
-    std::wstring JsonValue(const std::wstring& json, const std::wstring& key)
+    void EnsureWinrtApartment()
     {
-        const std::wregex pattern(L"\"" + key + LR"json("\s*:\s*"([^"]*)")json");
-        std::wsmatch match;
-        if (std::regex_search(json, match, pattern))
+        thread_local bool initialized = false;
+        if (!initialized)
         {
-            std::wstring value = match[1].str();
-            std::wstring unescaped;
-            unescaped.reserve(value.size());
-            for (size_t index = 0; index < value.size(); ++index)
+            winrt::init_apartment();
+            initialized = true;
+        }
+    }
+
+    int HexDigit(wchar_t ch)
+    {
+        if (ch >= L'0' && ch <= L'9')
+        {
+            return static_cast<int>(ch - L'0');
+        }
+        if (ch >= L'a' && ch <= L'f')
+        {
+            return static_cast<int>(ch - L'a' + 10);
+        }
+        if (ch >= L'A' && ch <= L'F')
+        {
+            return static_cast<int>(ch - L'A' + 10);
+        }
+        return -1;
+    }
+
+    uint32_t ReadJsonHex4(const std::wstring& value, size_t offset)
+    {
+        if (offset + 4 > value.size())
+        {
+            throw std::runtime_error("incomplete json unicode escape");
+        }
+
+        uint32_t codeUnit = 0;
+        for (size_t index = 0; index < 4; ++index)
+        {
+            const int digit = HexDigit(value[offset + index]);
+            if (digit < 0)
             {
-                if (value[index] == L'\\' && index + 1 < value.size())
+                throw std::runtime_error("invalid json unicode escape");
+            }
+            codeUnit = (codeUnit << 4) | static_cast<uint32_t>(digit);
+        }
+        return codeUnit;
+    }
+
+    void AppendJsonCodePoint(std::wstring& output, uint32_t codePoint)
+    {
+        if (codePoint <= 0xFFFF)
+        {
+            output.push_back(static_cast<wchar_t>(codePoint));
+            return;
+        }
+
+        codePoint -= 0x10000;
+        output.push_back(static_cast<wchar_t>(0xD800 + ((codePoint >> 10) & 0x3FF)));
+        output.push_back(static_cast<wchar_t>(0xDC00 + (codePoint & 0x3FF)));
+    }
+
+    std::wstring ParseJsonStringAt(const std::wstring& json, size_t start)
+    {
+        std::wstring result;
+        for (size_t index = start; index < json.size(); ++index)
+        {
+            const wchar_t ch = json[index];
+            if (ch == L'"')
+            {
+                return result;
+            }
+
+            if (ch != L'\\')
+            {
+                result.push_back(ch);
+                continue;
+            }
+
+            if (++index >= json.size())
+            {
+                throw std::runtime_error("incomplete json escape");
+            }
+
+            switch (json[index])
+            {
+            case L'"': result.push_back(L'"'); break;
+            case L'\\': result.push_back(L'\\'); break;
+            case L'/': result.push_back(L'/'); break;
+            case L'b': result.push_back(L'\b'); break;
+            case L'f': result.push_back(L'\f'); break;
+            case L'n': result.push_back(L'\n'); break;
+            case L'r': result.push_back(L'\r'); break;
+            case L't': result.push_back(L'\t'); break;
+            case L'u':
+            {
+                uint32_t codeUnit = ReadJsonHex4(json, index + 1);
+                index += 4;
+                if (codeUnit >= 0xD800 && codeUnit <= 0xDBFF)
                 {
-                    ++index;
-                    unescaped.push_back(value[index]);
+                    if (index + 6 >= json.size() || json[index + 1] != L'\\' || json[index + 2] != L'u')
+                    {
+                        throw std::runtime_error("missing json low surrogate");
+                    }
+
+                    const uint32_t low = ReadJsonHex4(json, index + 3);
+                    if (low < 0xDC00 || low > 0xDFFF)
+                    {
+                        throw std::runtime_error("invalid json low surrogate");
+                    }
+
+                    index += 6;
+                    const uint32_t codePoint = 0x10000 + (((codeUnit - 0xD800) << 10) | (low - 0xDC00));
+                    AppendJsonCodePoint(result, codePoint);
                 }
                 else
                 {
-                    unescaped.push_back(value[index]);
+                    AppendJsonCodePoint(result, codeUnit);
+                }
+                break;
+            }
+            default:
+                throw std::runtime_error("invalid json escape");
+            }
+        }
+
+        throw std::runtime_error("unterminated json string");
+    }
+
+    std::wstring JsonStringValueImpl(const std::wstring& json, const std::wstring& key)
+    {
+        const std::wstring quotedKey = L"\"" + key + L"\"";
+        size_t keyOffset = json.find(quotedKey);
+        while (keyOffset != std::wstring::npos)
+        {
+            size_t index = keyOffset + quotedKey.size();
+            while (index < json.size() && iswspace(json[index]))
+            {
+                ++index;
+            }
+
+            if (index < json.size() && json[index] == L':')
+            {
+                ++index;
+                while (index < json.size() && iswspace(json[index]))
+                {
+                    ++index;
+                }
+
+                if (index < json.size() && json[index] == L'"')
+                {
+                    return ParseJsonStringAt(json, index + 1);
                 }
             }
-            return unescaped;
+
+            keyOffset = json.find(quotedKey, keyOffset + 1);
         }
         return {};
     }
@@ -620,15 +922,14 @@ namespace
         record.packageFamilyName = package.Id().FamilyName().c_str();
         record.packageFullName = package.Id().FullName().c_str();
         record.owned = StartsWith(record.packageName, PackagePrefix);
-        record.packagePath = fs::path(package.InstalledLocation().Path().c_str());
+        record.installedPackagePath = fs::path(package.InstalledLocation().Path().c_str());
 
         const fs::path configPath = FindConfigForPackage(record.packageName);
-        if (fs::exists(configPath))
+        if (record.owned && ExistsNoThrow(configPath))
         {
             const auto config = ReadUtf8Text(configPath);
-            record.targetPath = JsonValue(config, L"target");
+            record.targetPath = JsonStringValueImpl(config, L"target");
             record.externalLocation = configPath.parent_path();
-            record.owned = true;
         }
 
         const fs::path stub = appalias::GetWindowsAppsAliasPath(alias);
@@ -640,6 +941,36 @@ namespace
 
 namespace appalias
 {
+    std::string WideToUtf8(std::wstring_view value)
+    {
+        return WideToUtf8Impl(value);
+    }
+
+    std::wstring Utf8ToWide(std::string_view value)
+    {
+        return Utf8ToWideImpl(value);
+    }
+
+    std::wstring QuoteCommandArgument(std::wstring_view value)
+    {
+        return QuoteCommandArgumentImpl(value);
+    }
+
+    fs::path GetModulePath()
+    {
+        return GetModulePathImpl();
+    }
+
+    std::wstring PathToFileUri(const fs::path& path)
+    {
+        return PathToFileUriImpl(path);
+    }
+
+    std::wstring JsonStringValue(const std::wstring& json, const std::wstring& key)
+    {
+        return JsonStringValueImpl(json, key);
+    }
+
     std::wstring NormalizeAlias(std::wstring_view alias)
     {
         if (alias.empty())
@@ -655,8 +986,9 @@ namespace appalias
             throw std::invalid_argument("alias must end with .exe");
         }
 
-        for (const wchar_t ch : value)
+        for (size_t index = 0; index < value.size(); ++index)
         {
+            const wchar_t ch = value[index];
             const bool allowed =
                 (ch >= L'a' && ch <= L'z') ||
                 (ch >= L'0' && ch <= L'9') ||
@@ -666,7 +998,11 @@ namespace appalias
 
             if (!allowed)
             {
-                throw std::invalid_argument("alias contains invalid characters");
+                std::ostringstream message;
+                message << "alias contains invalid character U+"
+                    << std::uppercase << std::hex << std::setw(4) << std::setfill('0') << static_cast<unsigned int>(ch)
+                    << " at position " << std::dec << index;
+                throw std::invalid_argument(message.str());
             }
         }
 
@@ -678,7 +1014,7 @@ namespace appalias
         return value;
     }
 
-    PackageIdentity BuildIdentity(std::wstring_view alias, std::wstring_view displayName, std::wstring_view publisherDisplayName)
+    PackageIdentity BuildIdentity(std::wstring_view alias, std::wstring_view displayName, std::wstring_view publisherDisplayName, std::wstring_view packageVersion)
     {
         PackageIdentity identity{};
         identity.alias = NormalizeAlias(alias);
@@ -688,7 +1024,7 @@ namespace appalias
         identity.publisher = ConfiguredPublisherSubject();
         identity.displayName = displayName.empty() ? identity.aliasStem : std::wstring(displayName);
         identity.publisherDisplayName = publisherDisplayName.empty() ? L"AppAliasGenerator" : std::wstring(publisherDisplayName);
-        identity.version = DefaultVersion;
+        identity.version = ResolvePackageVersion(packageVersion);
         return identity;
     }
 
@@ -775,12 +1111,7 @@ namespace appalias
             throw std::runtime_error("target path not found");
         }
 
-        Gdiplus::GdiplusStartupInput gdiplusInput{};
-        ULONG_PTR gdiplusToken = 0;
-        if (Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusInput, nullptr) != Gdiplus::Ok)
-        {
-            throw std::runtime_error("failed to initialize gdiplus");
-        }
+        EnsureGdiplusStarted();
 
         HICON icon = nullptr;
         try
@@ -802,7 +1133,6 @@ namespace appalias
             {
                 DestroyIcon(icon);
             }
-            Gdiplus::GdiplusShutdown(gdiplusToken);
             throw;
         }
 
@@ -810,35 +1140,47 @@ namespace appalias
         {
             DestroyIcon(icon);
         }
-        Gdiplus::GdiplusShutdown(gdiplusToken);
     }
+
+    bool TryFindAliasRecord(std::wstring_view alias, AliasRecord& record);
 
     OperationResult CreateAlias(const AliasCreateOptions& options)
     {
         OperationResult result{};
         try
         {
-            const PackageIdentity identity = BuildIdentity(options.alias, options.displayName, options.publisherDisplayName);
+            const PackageIdentity identity = BuildIdentity(options.alias, options.displayName, options.publisherDisplayName, options.packageVersion);
             const fs::path target = fs::absolute(options.targetPath);
-            if (!fs::exists(target))
+            if (!ExistsNoThrow(target))
             {
                 throw std::runtime_error("target path not found");
             }
 
+            AliasRecord existing{};
+            const bool hasExisting = TryFindAliasRecord(identity.alias, existing);
+            const bool stubExists = ExistsNoThrow(GetWindowsAppsAliasPath(identity.alias));
             if (!options.force)
             {
-                const auto existing = VerifyAlias(identity.alias);
-                if (existing.record.stubExists)
+                if (hasExisting || stubExists)
                 {
                     throw std::runtime_error("alias already exists; pass --force to replace owned alias");
                 }
             }
             else
             {
-                const auto existing = VerifyAlias(identity.alias);
-                if (existing.record.owned)
+                if (hasExisting && !existing.owned)
                 {
-                    RemoveAliasByAlias(identity.alias);
+                    throw std::runtime_error("refusing to replace foreign package alias");
+                }
+
+                if (!hasExisting && stubExists)
+                {
+                    throw std::runtime_error("refusing to replace alias stub without owned package");
+                }
+
+                if (hasExisting)
+                {
+                    RemoveAliasByPackage(existing.packageFullName);
                 }
             }
 
@@ -862,7 +1204,7 @@ namespace appalias
             result.record.displayName = identity.displayName;
             result.record.publisherDisplayName = identity.publisherDisplayName;
             result.record.targetPath = target;
-            result.record.packagePath = GetPackageMsixPath(identity);
+            result.record.stagedMsixPath = GetPackageMsixPath(identity);
             result.record.externalLocation = externalRoot;
             result.record.owned = true;
             result.record.stubExists = ExistsNoThrow(GetWindowsAppsAliasPath(identity.alias));
@@ -879,7 +1221,7 @@ namespace appalias
     std::vector<AliasRecord> ListAliases()
     {
         std::vector<AliasRecord> records;
-        winrt::init_apartment();
+        EnsureWinrtApartment();
         winrt::Windows::Management::Deployment::PackageManager packageManager;
 
         for (const auto& package : packageManager.FindPackagesForUser(L""))
@@ -907,15 +1249,26 @@ namespace appalias
         return records;
     }
 
-    OperationResult RemoveAliasByAlias(std::wstring_view alias)
+    bool TryFindAliasRecord(std::wstring_view alias, AliasRecord& record)
     {
         const std::wstring normalized = NormalizeAlias(alias);
-        for (const auto& record : ListAliases())
+        for (const auto& candidate : ListAliases())
         {
-            if (Lower(record.alias) == normalized)
+            if (Lower(candidate.alias) == normalized)
             {
-                return RemoveAliasByPackage(record.packageFullName);
+                record = candidate;
+                return true;
             }
+        }
+        return false;
+    }
+
+    OperationResult RemoveAliasByAlias(std::wstring_view alias)
+    {
+        AliasRecord record{};
+        if (TryFindAliasRecord(alias, record))
+        {
+            return RemoveAliasByPackage(record.packageFullName);
         }
 
         OperationResult result{};
@@ -929,7 +1282,7 @@ namespace appalias
         OperationResult result{};
         try
         {
-            winrt::init_apartment();
+            EnsureWinrtApartment();
             winrt::Windows::Management::Deployment::PackageManager packageManager;
 
             for (const auto& package : packageManager.FindPackagesForUser(L""))
@@ -991,15 +1344,13 @@ namespace appalias
         try
         {
             const std::wstring normalized = NormalizeAlias(alias);
-            for (const auto& record : ListAliases())
+            AliasRecord record{};
+            if (TryFindAliasRecord(normalized, record))
             {
-                if (Lower(record.alias) == normalized)
-                {
-                    result.record = record;
-                    result.succeeded = record.stubExists && record.stubIsAppExecLink;
-                    result.message = result.succeeded ? L"alias has AppExecLink stub" : L"alias package found but stub missing or wrong type";
-                    return result;
-                }
+                result.record = record;
+                result.succeeded = record.stubExists && record.stubIsAppExecLink;
+                result.message = result.succeeded ? L"alias has AppExecLink stub" : L"alias package found but stub missing or wrong type";
+                return result;
             }
 
             result.record.alias = normalized;

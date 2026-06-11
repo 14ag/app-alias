@@ -1,5 +1,6 @@
 param(
-    [switch]$Machine
+    [switch]$Machine,
+    [switch]$Force
 )
 
 Set-StrictMode -Version Latest
@@ -10,7 +11,17 @@ New-Item -ItemType Directory -Force -Path $CertDir | Out-Null
 
 $pfxPath = Join-Path $CertDir "AppAliasGenerator.pfx"
 $cerPath = Join-Path $CertDir "AppAliasGenerator.cer"
-$password = ConvertTo-SecureString "AppAliasGenerator" -Force -AsPlainText
+$plainPassword = if ($env:APPALIAS_PFX_PASSWORD) { $env:APPALIAS_PFX_PASSWORD } else { "AppAliasGenerator" }
+$password = ConvertTo-SecureString $plainPassword -Force -AsPlainText
+
+if (((Test-Path -LiteralPath $pfxPath) -or (Test-Path -LiteralPath $cerPath)) -and (-not $Force)) {
+    throw "Certificate files already exist. Re-run with -Force to replace them."
+}
+
+if ($Force) {
+    Remove-Item -LiteralPath $pfxPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $cerPath -Force -ErrorAction SilentlyContinue
+}
 
 $cert = New-SelfSignedCertificate `
     -Type Custom `

@@ -8,14 +8,12 @@ Project: Windows App Execution Alias generator.
   `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Test-AppAliasPrereqs.ps1`
 - Build native targets and run CTest:
   `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Build-AppAlias.ps1`
-- Legacy PowerShell tests:
-  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\AliasManager.Tests.ps1`
 - Create current-user test cert:
   `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\New-AppAliasCert.ps1`
 - Use existing trusted cert for package signing:
   `$env:APPALIAS_PUBLISHER_SUBJECT='CN=<subject>'; $env:APPALIAS_CERT_SHA1='<thumbprint>'`
 - Create Chrome test alias:
-  `.\build\Release\AppAlias.Cli.exe create --alias chrome-appalias.exe --target "C:\Program Files\Google\Chrome\Application\chrome.exe" --display-name ChromeAppAlias --publisher AppAliasGenerator --force`
+  `.\build\Release\AppAlias.Cli.exe create --alias chrome-appalias.exe --target "C:\Program Files\Google\Chrome\Application\chrome.exe" --display-name ChromeAppAlias --publisher AppAliasGenerator --package-version 1.0.0.0 --force`
 - Verify alias:
   `.\build\Release\AppAlias.Cli.exe verify --alias chrome-appalias.exe`
 - List aliases:
@@ -30,7 +28,7 @@ Project: Windows App Execution Alias generator.
 - `src\AppAlias.Cli`: `appalias create/list/remove/verify`.
 - `src\AppAlias.Ui`: native Win32 UI shell. It is not WinUI 3 yet.
 - New Settings-visible aliases use signed full MSIX packages via `PackageManager.AddPackageByUriAsync`.
-- Do not use symlink, App Paths, PATH, or legacy PowerShell fallback for Settings-visible aliases.
+- Do not use symlink, App Paths, PATH, or PowerShell fallback for Settings-visible aliases.
 
 ## MSIX Alias Contract
 
@@ -57,7 +55,15 @@ Project: Windows App Execution Alias generator.
 - `remove --alias <name.exe>` finds installed alias, then removes the owning package if owned.
 - `remove --package <name-or-full-name>` removes owned package by name or full name.
 - Foreign aliases are listed but not removed.
+- `create --force` refuses foreign aliases before deployment.
+- `remove` accepts either `--alias` or `--package`, not both.
 - `python.exe` and `python3.exe` are owned by `Microsoft.DesktopAppInstaller`; removing those rows means removing or replacing App Installer, not deleting a stub.
+
+## CLI Contract
+
+- Non-JSON `list` output is tab-delimited: alias, package name, owner state.
+- JSON `list` fields: `alias`, `packageName`, `packageFamilyName`, `packageFullName`, `target`, `installedPackagePath`, `stagedMsixPath`, `externalLocation`, `owned`, `stubExists`, `stubIsAppExecLink`.
+- Exit codes: `0` success, `1` operation failed, `2` usage error, `3` not found, `4` foreign alias blocked, `5` stub invalid, `6` exception.
 
 ## Verification
 
@@ -74,9 +80,15 @@ Project: Windows App Execution Alias generator.
 ## Icons
 
 - Settings page shows alias row from package manifest and AppExecLink state.
-- Create path extracts the target file icon via Shell APIs and writes package PNG assets.
+- Create path extracts the target executable icon and writes package PNG assets.
 - Expected assets: `Assets\StoreLogo.png`, `Assets\Square44x44Logo.png`, `Assets\Square150x150Logo.png`, plus `Square44x44Logo.targetsize-*` variants.
-- If Settings keeps an old blank icon, close/reopen Settings first. If cache persists, bump package version or package name, then recreate alias.
+- If Settings keeps an old blank icon, close/reopen Settings first. If cache persists, use `--package-version` or a new package name, then recreate alias.
+
+## Docs
+
+- Root docs: `README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`.
+- Long-form docs: `docs\Architecture.md`, `docs\Troubleshooting.md`.
+- Document native MSIX packages as the supported workflow.
 
 ## Gotchas
 
