@@ -30,11 +30,11 @@ The manifest uses `EntryPoint="Windows.FullTrustApplication"`, `runFullTrust`, `
 
 When a user runs the alias, Windows follows the `0x8000001b` AppExecLink stub and activates the package application. The package starts `AppAlias.Proxy.exe`. The proxy reads `alias.json`, rebuilds the command line from the original arguments, starts the target process, waits for it, and returns the target exit code.
 
-For `.cmd` and `.bat` targets, the proxy runs `cmd.exe /d /c`. For executable targets, it launches the target path directly.
+For `.cmd` and `.bat` targets, the proxy runs the full `%SystemRoot%\System32\cmd.exe` path. For `.ps1` targets, it runs the full Windows PowerShell path. For executable targets, it launches the target path directly. It does not resolve targets through `PATH`.
 
 ## Icon flow
 
-Core calls Shell icon APIs for the target executable and writes PNG files into `Assets\` before packing the MSIX. The package includes:
+Core extracts the target executable icon and writes PNG files into `Assets\` before packing the MSIX. Icon extraction can touch shell/icon APIs, so UI callers keep it away from the message thread. The package includes:
 
 - `StoreLogo.png`
 - `Square44x44Logo.png`

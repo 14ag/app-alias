@@ -11,7 +11,11 @@ Project: Windows App Execution Alias generator.
 - Create current-user test cert:
   `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\New-AppAliasCert.ps1`
 - Use existing trusted cert for package signing:
-  `$env:APPALIAS_PUBLISHER_SUBJECT='CN=<subject>'; $env:APPALIAS_CERT_SHA1='<thumbprint>'`
+  `$env:APPALIAS_PUBLISHER_SUBJECT='CN=<subject>'; $env:APPALIAS_CERT_SHA1='<thumbprint>'; $env:APPALIAS_CERT_STORE='CurrentUser'`
+- Use explicit PFX signing:
+  `$env:APPALIAS_PFX='<path>'; $env:APPALIAS_PFX_PASSWORD='<password>'`
+- Install machine-trusted test cert with elevation helper:
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Install-AppAliasCertMachine.ps1`
 - Create Chrome test alias:
   `.\build\Release\AppAlias.Cli.exe create --alias chrome-appalias.exe --target "C:\Program Files\Google\Chrome\Application\chrome.exe" --display-name ChromeAppAlias --publisher AppAliasGenerator --package-version 1.0.0.0 --force`
 - Verify alias:
@@ -29,6 +33,7 @@ Project: Windows App Execution Alias generator.
 - `src\AppAlias.Ui`: native Win32 UI shell. It is not WinUI 3 yet.
 - New Settings-visible aliases use signed full MSIX packages via `PackageManager.AddPackageByUriAsync`.
 - Do not use symlink, App Paths, PATH, or PowerShell fallback for Settings-visible aliases.
+- `.vscode\get_admin.bat` is a dev elevation helper. It is allowed for certificate installation prompts and must return elevated command exit codes.
 
 ## MSIX Alias Contract
 
@@ -81,6 +86,7 @@ Project: Windows App Execution Alias generator.
 
 - Settings page shows alias row from package manifest and AppExecLink state.
 - Create path extracts the target executable icon and writes package PNG assets.
+- Icon extraction can call shell/icon APIs. Keep it off UI message thread.
 - Expected assets: `Assets\StoreLogo.png`, `Assets\Square44x44Logo.png`, `Assets\Square150x150Logo.png`, plus `Square44x44Logo.targetsize-*` variants.
 - If Settings keeps an old blank icon, close/reopen Settings first. If cache persists, use `--package-version` or a new package name, then recreate alias.
 

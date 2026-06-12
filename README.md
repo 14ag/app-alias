@@ -30,7 +30,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Test-AppAliasP
 Create a current-user test certificate:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\New-AppAliasCert.ps1
+$cert = powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\New-AppAliasCert.ps1 | ConvertFrom-Json
+$env:APPALIAS_PUBLISHER_SUBJECT = $cert.Subject
+$env:APPALIAS_CERT_SHA1 = $cert.Thumbprint
 ```
 
 You can also sign with an existing cert:
@@ -38,9 +40,17 @@ You can also sign with an existing cert:
 ```powershell
 $env:APPALIAS_PUBLISHER_SUBJECT = 'CN=YourCertSubject'
 $env:APPALIAS_CERT_SHA1 = '<thumbprint>'
+$env:APPALIAS_CERT_STORE = 'CurrentUser'
 ```
 
 The package publisher has to match the signing certificate subject. If it doesn't, deployment fails before the alias can be registered.
+
+PFX signing is explicit. Set both variables when using a PFX:
+
+```powershell
+$env:APPALIAS_PFX = "$env:LOCALAPPDATA\AppAliasGenerator\Cert\AppAliasGenerator.pfx"
+$env:APPALIAS_PFX_PASSWORD = '<password>'
+```
 
 ## Build
 
@@ -141,6 +151,7 @@ Expected tag:
 
 - Package names strip punctuation from alias stems. `chrome-appalias.exe` becomes `AppAliasGenerator.chromeappalias.<hash>`. This avoids AppModel activation failures seen with hyphenated package names.
 - Settings can cache old icons. Close and reopen Settings after recreating an alias. If the icon still does not change, recreate the alias with `--package-version` set to a new version or use a new package identity.
+- Icon extraction reads the target executable during create. UI callers run create/verify/remove away from the message thread so shell and icon APIs do not freeze the window.
 ## Documentation
 
 - [Architecture](docs/Architecture.md)

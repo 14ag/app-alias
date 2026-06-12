@@ -7,17 +7,34 @@ if (-not (Test-Path -LiteralPath $VsWhere)) {
     throw "vswhere.exe not found"
 }
 
-$VsInstall = (& $VsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath).Trim()
-if (-not $VsInstall) {
+$VsInfoJson = & $VsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json
+if ($LASTEXITCODE -ne 0 -or -not $VsInfoJson) {
     throw "Visual Studio C++ Build Tools not found"
 }
 
-$VsVersion = (& $VsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion).Trim()
-$VsMajor = [int]($VsVersion.Split(".")[0])
+$VsInfo = $VsInfoJson | ConvertFrom-Json
+if ($VsInfo -is [array]) {
+    $VsInfo = $VsInfo | Select-Object -First 1
+}
+
+$VsInstall = [string]$VsInfo.installationPath
+if (-not $VsInstall) {
+    throw "Visual Studio installationPath missing from vswhere output"
+}
+
+$VsVersion = [version]([string]$VsInfo.installationVersion)
+$VsMajor = $VsVersion.Major
 $Generator = switch ($VsMajor) {
     17 { "Visual Studio 17 2022" }
     16 { "Visual Studio 16 2019" }
-    default { throw "Unsupported Visual Studio major version: $VsMajor" }
+    default {
+        if ($VsMajor -gt 17) {
+            "Visual Studio 17 2022"
+        }
+        else {
+            throw "Unsupported Visual Studio major version: $VsMajor"
+        }
+    }
 }
 
 $DevCmd = Join-Path $VsInstall "Common7\Tools\VsDevCmd.bat"
@@ -39,8 +56,11 @@ $Lines = @(
 )
 
 try {
-    Set-Content -LiteralPath $TempCmd -Value $Lines -Encoding ASCII
+    Set-Content -LiteralPath $TempCmd -Value $Lines -Encoding UTF8
     cmd.exe /d /c "`"$TempCmd`""
+    if ($null -eq $LASTEXITCODE) {
+        exit 1
+    }
     exit $LASTEXITCODE
 }
 finally {

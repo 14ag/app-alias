@@ -9,26 +9,72 @@
 #include <thread>
 #include <vector>
 
-#pragma comment(lib, "comctl32.lib")
-
 namespace
 {
     constexpr int AliasListId = 1001;
     constexpr int RefreshButtonId = 1002;
     constexpr int VerifyButtonId = 1003;
     constexpr int RemoveButtonId = 1004;
+    constexpr int StatusTextId = 1005;
     constexpr UINT RefreshCompleteMessage = WM_APP + 1;
+    constexpr UINT ActionCompleteMessage = WM_APP + 2;
+
+    enum class ActionKind
+    {
+        Verify,
+        Remove
+    };
+
+    struct RefreshResult
+    {
+        std::vector<appalias::AliasRecord> records;
+        std::wstring error;
+    };
+
+    struct ActionResult
+    {
+        ActionKind kind = ActionKind::Verify;
+        appalias::OperationResult result;
+    };
 
     struct WindowState
     {
         HWND list = nullptr;
+        HWND refreshButton = nullptr;
+        HWND verifyButton = nullptr;
+        HWND removeButton = nullptr;
+        HWND status = nullptr;
         std::wstring selectedAlias;
         bool refreshInFlight = false;
+        bool actionInFlight = false;
+        std::thread refreshThread;
+        std::thread actionThread;
+        int dpi = 96;
     };
 
     WindowState* State(HWND hwnd)
     {
         return reinterpret_cast<WindowState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    }
+
+    int Scale(int value, int dpi)
+    {
+        return MulDiv(value, dpi, 96);
+    }
+
+    void SetBusy(WindowState& state, bool busy)
+    {
+        EnableWindow(state.refreshButton, !busy);
+        EnableWindow(state.verifyButton, !busy);
+        EnableWindow(state.removeButton, !busy);
+    }
+
+    void SetStatus(WindowState& state, const std::wstring& text)
+    {
+        if (state.status)
+        {
+            SetWindowTextW(state.status, text.c_str());
+        }
     }
 
     void AddColumn(HWND list, int index, int width, const wchar_t* text)
@@ -104,6 +150,29 @@ namespace
         SelectAlias(state.list, state.selectedAlias);
     }
 
+    void Layout(HWND hwnd, WindowState& state, int width, int height)
+    {
+        const int margin = Scale(12, state.dpi);
+        const int buttonY = Scale(12, state.dpi);
+        const int buttonW = Scale(88, state.dpi);
+        const int buttonH = Scale(28, state.dpi);
+        const int gap = Scale(8, state.dpi);
+        const int listY = Scale(52, state.dpi);
+        const int statusH = Scale(24, state.dpi);
+
+        MoveWindow(state.refreshButton, margin, buttonY, buttonW, buttonH, TRUE);
+        MoveWindow(state.verifyButton, margin + buttonW + gap, buttonY, buttonW, buttonH, TRUE);
+        MoveWindow(state.removeButton, margin + ((buttonW + gap) * 2), buttonY, buttonW, buttonH, TRUE);
+        MoveWindow(state.list, margin, listY, width - (margin * 2), height - listY - statusH - margin, TRUE);
+        MoveWindow(state.status, margin, height - statusH - margin, width - (margin * 2), statusH, TRUE);
+        ListView_SetColumnWidth(state.list, 0, Scale(150, state.dpi));
+        ListView_SetColumnWidth(state.list, 1, Scale(300, state.dpi));
+        ListView_SetColumnWidth(state.list, 2, Scale(260, state.dpi));
+        ListView_SetColumnWidth(state.list, 3, Scale(90, state.dpi));
+        ListView_SetColumnWidth(state.list, 4, Scale(120, state.dpi));
+        UNREFERENCED_PARAMETER(hwnd);
+    }
+
     void Refresh(HWND hwnd)
     {
         WindowState* state = State(hwnd);
@@ -114,23 +183,60 @@ namespace
 
         state->selectedAlias = SelectedAlias(state->list);
         state->refreshInFlight = true;
+        SetBusy(*state, true);
+        SetStatus(*state, L"Refreshing...");
 
-        std::thread([hwnd] {
-            auto records = std::make_unique<std::vector<appalias::AliasRecord>>();
+        if (state->refreshThread.joinable())
+        {
+            state->refreshThread.join();
+        }
+
+        state->refreshThread = std::thread([hwnd] {
+            auto result = std::make_unique<RefreshResult>();
             try
             {
-                *records = appalias::ListAliases();
+                result->records = appalias::ListAliases();
             }
-            catch (...)
+            catch (const std::exception&)
             {
+                result->error = L"ListAliases failed";
             }
 
-            if (!PostMessageW(hwnd, RefreshCompleteMessage, 0, reinterpret_cast<LPARAM>(records.get())))
+            if (!PostMessageW(hwnd, RefreshCompleteMessage, 0, reinterpret_cast<LPARAM>(result.get())))
             {
                 return;
             }
-            records.release();
-        }).detach();
+            result.release();
+        });
+    }
+
+    void RunAction(HWND hwnd, ActionKind kind, std::wstring alias)
+    {
+        WindowState* state = State(hwnd);
+        if (!state || state->actionInFlight || state->refreshInFlight)
+        {
+            return;
+        }
+
+        state->actionInFlight = true;
+        SetBusy(*state, true);
+        SetStatus(*state, kind == ActionKind::Verify ? L"Verifying..." : L"Removing...");
+
+        if (state->actionThread.joinable())
+        {
+            state->actionThread.join();
+        }
+
+        state->actionThread = std::thread([hwnd, kind, alias = std::move(alias)] {
+            auto result = std::make_unique<ActionResult>();
+            result->kind = kind;
+            result->result = kind == ActionKind::Verify ? appalias::VerifyAlias(alias) : appalias::RemoveAliasByAlias(alias);
+            if (!PostMessageW(hwnd, ActionCompleteMessage, 0, reinterpret_cast<LPARAM>(result.get())))
+            {
+                return;
+            }
+            result.release();
+        });
     }
 
     LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
@@ -142,17 +248,22 @@ namespace
             auto state = std::make_unique<WindowState>();
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state.get()));
 
-            CreateWindowW(L"BUTTON", L"Refresh", WS_CHILD | WS_VISIBLE, 12, 12, 88, 28, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(RefreshButtonId)), nullptr, nullptr);
-            CreateWindowW(L"BUTTON", L"Verify", WS_CHILD | WS_VISIBLE, 108, 12, 88, 28, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(VerifyButtonId)), nullptr, nullptr);
-            CreateWindowW(L"BUTTON", L"Remove", WS_CHILD | WS_VISIBLE, 204, 12, 88, 28, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(RemoveButtonId)), nullptr, nullptr);
+            state->dpi = GetDpiForWindow(hwnd);
+            state->refreshButton = CreateWindowW(L"BUTTON", L"Refresh", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(RefreshButtonId)), nullptr, nullptr);
+            state->verifyButton = CreateWindowW(L"BUTTON", L"Verify", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(VerifyButtonId)), nullptr, nullptr);
+            state->removeButton = CreateWindowW(L"BUTTON", L"Remove", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(RemoveButtonId)), nullptr, nullptr);
 
-            state->list = CreateWindowW(WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL, 12, 52, 940, 420, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(AliasListId)), nullptr, nullptr);
+            state->list = CreateWindowW(WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(AliasListId)), nullptr, nullptr);
+            state->status = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(StatusTextId)), nullptr, nullptr);
             ListView_SetExtendedListViewStyle(state->list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
             AddColumn(state->list, 0, 150, L"Alias");
             AddColumn(state->list, 1, 300, L"Target");
             AddColumn(state->list, 2, 260, L"Package");
             AddColumn(state->list, 3, 90, L"Owner");
             AddColumn(state->list, 4, 120, L"Settings");
+            RECT client{};
+            GetClientRect(hwnd, &client);
+            Layout(hwnd, *state, client.right - client.left, client.bottom - client.top);
             state.release();
             Refresh(hwnd);
             return 0;
@@ -168,9 +279,7 @@ namespace
                 const auto alias = state ? SelectedAlias(state->list) : std::wstring{};
                 if (!alias.empty())
                 {
-                    const auto result = appalias::VerifyAlias(alias);
-                    MessageBoxW(hwnd, result.message.c_str(), L"Verify", MB_OK);
-                    Refresh(hwnd);
+                    RunAction(hwnd, ActionKind::Verify, alias);
                 }
             }
             else if (LOWORD(wparam) == RemoveButtonId)
@@ -179,31 +288,81 @@ namespace
                 const auto alias = state ? SelectedAlias(state->list) : std::wstring{};
                 if (!alias.empty())
                 {
-                    const auto result = appalias::RemoveAliasByAlias(alias);
-                    MessageBoxW(hwnd, result.message.c_str(), L"Remove", MB_OK);
-                    Refresh(hwnd);
+                    RunAction(hwnd, ActionKind::Remove, alias);
                 }
             }
             return 0;
         case RefreshCompleteMessage:
         {
-            std::unique_ptr<std::vector<appalias::AliasRecord>> records(reinterpret_cast<std::vector<appalias::AliasRecord>*>(lparam));
+            std::unique_ptr<RefreshResult> result(reinterpret_cast<RefreshResult*>(lparam));
             WindowState* state = State(hwnd);
             if (state)
             {
+                if (state->refreshThread.joinable())
+                {
+                    state->refreshThread.join();
+                }
                 state->refreshInFlight = false;
-                PopulateList(*state, *records);
+                SetBusy(*state, false);
+                if (!result->error.empty())
+                {
+                    SetStatus(*state, L"Refresh failed: " + result->error);
+                }
+                else
+                {
+                    PopulateList(*state, result->records);
+                    SetStatus(*state, L"Ready");
+                }
+            }
+            return 0;
+        }
+        case ActionCompleteMessage:
+        {
+            std::unique_ptr<ActionResult> result(reinterpret_cast<ActionResult*>(lparam));
+            WindowState* state = State(hwnd);
+            if (state)
+            {
+                if (state->actionThread.joinable())
+                {
+                    state->actionThread.join();
+                }
+                state->actionInFlight = false;
+                SetBusy(*state, false);
+                SetStatus(*state, result->result.message);
+                if (result->kind == ActionKind::Remove && result->result.succeeded)
+                {
+                    Refresh(hwnd);
+                }
             }
             return 0;
         }
         case WM_SIZE:
             if (WindowState* state = State(hwnd); state && state->list)
             {
-                MoveWindow(state->list, 12, 52, LOWORD(lparam) - 24, HIWORD(lparam) - 64, TRUE);
+                Layout(hwnd, *state, LOWORD(lparam), HIWORD(lparam));
+            }
+            return 0;
+        case WM_DPICHANGED:
+            if (WindowState* state = State(hwnd))
+            {
+                state->dpi = HIWORD(wparam);
+                const RECT* rect = reinterpret_cast<const RECT*>(lparam);
+                SetWindowPos(hwnd, nullptr, rect->left, rect->top, rect->right - rect->left, rect->bottom - rect->top, SWP_NOZORDER | SWP_NOACTIVATE);
             }
             return 0;
         case WM_DESTROY:
-            delete State(hwnd);
+            if (WindowState* state = State(hwnd))
+            {
+                if (state->refreshThread.joinable())
+                {
+                    state->refreshThread.join();
+                }
+                if (state->actionThread.joinable())
+                {
+                    state->actionThread.join();
+                }
+                delete state;
+            }
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             PostQuitMessage(0);
             return 0;
@@ -228,9 +387,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
     windowClass.lpszClassName = L"AppAliasUiWindow";
     windowClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
     windowClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
-    RegisterClassW(&windowClass);
+    if (!RegisterClassW(&windowClass))
+    {
+        return 1;
+    }
 
-    HWND hwnd = CreateWindowExW(0, windowClass.lpszClassName, L"AppAlias Generator", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 980, 560, nullptr, nullptr, instance, nullptr);
+    const int dpi = GetDpiForSystem();
+    HWND hwnd = CreateWindowExW(0, windowClass.lpszClassName, L"AppAlias Generator", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, Scale(980, dpi), Scale(560, dpi), nullptr, nullptr, instance, nullptr);
     if (!hwnd)
     {
         return 1;

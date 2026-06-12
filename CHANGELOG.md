@@ -13,6 +13,7 @@ This project uses the Keep a Changelog structure.
 - Build, preflight, and certificate helper scripts.
 - Repository documentation for setup, architecture, and troubleshooting.
 - Documented CLI JSON fields and exit codes.
+- CLI, proxy, and Core tests for JSON parsing, URI encoding, proxy forwarding, and CLI exit contracts.
 
 ### Changed
 
@@ -21,6 +22,8 @@ This project uses the Keep a Changelog structure.
 - Proxy binaries build with static CRT.
 - CLI non-JSON list output is tab-delimited.
 - `create --force` refuses foreign aliases before deployment.
+- Signing now prefers certificate-store thumbprints; PFX signing requires explicit password configuration.
+- UI refresh, verify, and remove work now run outside the message thread.
 
 ### Removed
 

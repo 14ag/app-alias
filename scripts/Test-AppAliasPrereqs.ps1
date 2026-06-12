@@ -13,7 +13,10 @@ function Find-Tool {
     if (Test-Path -LiteralPath $sdkRoot) {
         $match = Get-ChildItem -LiteralPath $sdkRoot -Recurse -Filter $Name -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -match '\\x64\\' } |
-            Sort-Object FullName -Descending |
+            Sort-Object {
+                $versionName = Split-Path (Split-Path $_.DirectoryName -Parent) -Leaf
+                try { [version]$versionName } catch { [version]"0.0.0.0" }
+            } -Descending |
             Select-Object -First 1
         if ($match) {
             return $match.FullName
@@ -36,7 +39,7 @@ function Find-Cl {
     }
 
     $match = Get-ChildItem -LiteralPath $toolsRoot -Directory -ErrorAction SilentlyContinue |
-        Sort-Object Name -Descending |
+        Sort-Object { try { [version]$_.Name } catch { [version]"0.0.0.0" } } -Descending |
         ForEach-Object { Join-Path $_.FullName "bin\Hostx64\x64\cl.exe" } |
         Where-Object { Test-Path -LiteralPath $_ } |
         Select-Object -First 1
@@ -71,5 +74,6 @@ foreach ($item in $required.GetEnumerator()) {
 } | ConvertTo-Json -Depth 4
 
 if ($missing.Count -gt 0) {
+    Write-Error ("Missing required app-alias build tools: {0}" -f ($missing -join ", "))
     exit 1
 }

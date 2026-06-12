@@ -82,7 +82,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Test-AppAliasP
 Create a local cert:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\New-AppAliasCert.ps1
+$cert = powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\New-AppAliasCert.ps1 | ConvertFrom-Json
+$env:APPALIAS_PUBLISHER_SUBJECT = $cert.Subject
+$env:APPALIAS_CERT_SHA1 = $cert.Thumbprint
 ```
 
 For an existing cert, set:
@@ -90,15 +92,25 @@ For an existing cert, set:
 ```powershell
 $env:APPALIAS_PUBLISHER_SUBJECT = 'CN=YourCertSubject'
 $env:APPALIAS_CERT_SHA1 = '<thumbprint>'
+$env:APPALIAS_CERT_STORE = 'CurrentUser'
 ```
 
 The package publisher and certificate subject must match.
+
+For PFX signing, set both values. The tool does not use a default PFX password.
+
+```powershell
+$env:APPALIAS_PFX = 'C:\path\signing.pfx'
+$env:APPALIAS_PFX_PASSWORD = '<password>'
+```
 
 If `Get-AuthenticodeSignature` says the MSIX signature is valid but deployment fails with `0x800B0109`, Windows does not trust the signing root for package deployment. On this machine that required machine-level trust. Run the cert helper from elevated Windows PowerShell with `-Machine`, or use a signing cert already trusted under LocalMachine:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\New-AppAliasCert.ps1 -Machine -Force
 ```
+
+The dev helper `.vscode\get_admin.bat` prompts for elevation and returns the elevated command exit code. `scripts\Install-AppAliasCertMachine.ps1` uses it for machine-level cert trust.
 
 ## Remove refuses alias
 
