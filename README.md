@@ -1,3 +1,4 @@
+![Banner](./assets/banner.webp)
 # App Alias Generator
 
 Need an alias to show up in Windows Settings? App Alias Generator builds a signed MSIX package for it. It doesn't use symlinks, `App Paths`, or `PATH` edits.
